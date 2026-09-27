@@ -1,0 +1,27 @@
+[model]
+name_or_path = "./models/your-local-llm"
+device = "auto"
+dtype = "auto"
+local_files_only = true
+max_prompt_tokens = 4096
+
+[prompt]
+format = "auto"
+enable_thinking = false
+
+[lora]
+rank = 16
+alpha = 32
+dropout = 0.0
+target_modules = "all-linear"
+
+[training]
+data = "examples/train.jsonl"
+eval_data = "examples/eval.jsonl"
+output_dir = "outputs/domain-adapter"
+epochs = 3
+batch_size = 2
+gradient_accumulation_steps = 4
+learning_rate = 0.0001
+gradient_checkpointing = true
+seed = 42

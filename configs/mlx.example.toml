@@ -1,0 +1,8 @@
+[model]
+backend = "mlx"
+name_or_path = "./models/your-mlx-model"
+max_prompt_tokens = 8192
+
+[prompt]
+format = "auto"
+enable_thinking = false

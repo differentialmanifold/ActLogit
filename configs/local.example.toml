@@ -1,0 +1,11 @@
+[model]
+# Any supported Transformers causal LM, including your own local Qwen checkpoint.
+name_or_path = "./models/your-local-llm"
+device = "auto"
+dtype = "auto"
+local_files_only = true
+max_prompt_tokens = 4096
+
+[prompt]
+format = "auto"
+enable_thinking = false

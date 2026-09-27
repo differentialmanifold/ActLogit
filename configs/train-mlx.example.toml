@@ -1,0 +1,25 @@
+[model]
+backend = "mlx"
+name_or_path = "./models/your-mlx-model"
+max_prompt_tokens = 8192
+
+[prompt]
+format = "auto"
+enable_thinking = false
+
+[lora]
+rank = 16
+alpha = 32
+dropout = 0.0
+target_modules = "all-linear"
+# Set num_layers to train only the final N blocks; omit to train all blocks.
+
+[training]
+data = "examples/train.jsonl"
+eval_data = "examples/eval.jsonl"
+output_dir = "outputs/domain-adapter"
+epochs = 3
+batch_size = 1
+gradient_accumulation_steps = 8
+learning_rate = 0.0001
+seed = 42

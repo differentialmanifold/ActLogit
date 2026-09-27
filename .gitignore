@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+outputs/
+models/
+.env
+.DS_Store
+.idea/
+.vscode/
+build/
+.env.*
+!.env.example
+
+# Keep editable local configurations out of Git; publish templates only.
+/configs/*.toml
+!/configs/*.example.toml

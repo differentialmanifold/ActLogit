@@ -1,0 +1,30 @@
+{
+  "model": "actlogit",
+  "state": {
+    "ticket": "I was charged twice. Please refund the duplicate today."
+  },
+  "questions": {
+    "team": {
+      "type": "choice",
+      "instructions": "Which team should handle this ticket?",
+      "criteria": {
+        "billing": "Payments, invoices and refunds",
+        "technical": "Software bugs and connectivity",
+        "account": "Account access and profile changes"
+      }
+    },
+    "refund_requested": {
+      "type": "noul",
+      "instructions": "Does the customer explicitly request a refund?"
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "How soon does the customer need a response?",
+      "criteria": [
+        "No deadline",
+        "Within a week",
+        "Today or sooner"
+      ]
+    }
+  }
+}
