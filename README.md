@@ -4,7 +4,7 @@
 
 **Run typed decisions with local LLMs. Fine-tune with offline distributions.**
 
-ActLogit provides a Jev-style `POST /v1/systemone` API for local language models, with **Choice, Noul, and Score** questions in a single request. It supports Transformers (CUDA / MPS / CPU), MLX (Apple Silicon), and offline **Forward KL + LoRA** fine-tuning.
+ActLogit provides a Jev-compatible `POST /v1/systemone` API for local language models, with **Choice, Noul, and Score** questions in a single request. It supports Transformers (CUDA / MPS / CPU), MLX (Apple Silicon), and offline **Forward KL + LoRA** fine-tuning.
 
 ## Quick start
 
@@ -24,12 +24,6 @@ Edit `configs/local.toml` and point `model.name_or_path` to a local Transformers
 name_or_path = "/absolute/path/to/model"
 device = "auto"
 dtype = "auto"
-local_files_only = true
-max_prompt_tokens = 4096
-
-[prompt]
-format = "auto"
-enable_thinking = false
 ```
 
 Start the server:
@@ -51,7 +45,11 @@ Set the model directory in `configs/mlx.toml`, then start:
 uv run actlogit serve --config configs/mlx.toml --port 8000
 ```
 
-Use a text-generation model supported by the selected backend. Models are loaded locally by default. For Transformers, you can also set a Hugging Face model ID and `local_files_only = false`.
+Use an existing local directory containing a text-generation model supported by your backend. ActLogit does not download model weights.
+
+ActLogit uses the tokenizer's chat template when available, with thinking disabled, and falls back to a plain-text prompt otherwise. No prompt format configuration is needed. Choose a model that supports direct answers or a non-thinking mode.
+
+`model.max_prompt_tokens` is optional. Omit it to use the context limit declared by the model/tokenizer. Set a lower value, such as `4096`, to bound deployment latency and memory use. The effective limit is the smaller of the deployment budget and the model limit, including instructions, state, choices, and template tokens. Oversized inputs are rejected, never silently truncated. If the model has no usable context metadata, configure the limit explicitly.
 
 ## API requests
 
@@ -98,7 +96,7 @@ Results appear under `answers`, using the same question IDs:
 | `noul` | `noul` | Probability of yes, from 0 to 1; no separate confidence field |
 | `score` | `score`, `legend`, `probabilities`, `confidence` | Probability-weighted level index, from 0 to N−1 for N levels; may be fractional |
 
-Choice accepts 1–255 options with string, JSON, or `null` descriptions, subject to the model's label capacity. Score accepts 2–10 levels ordered from low to high. Noul optionally accepts `criteria: {"true": "What yes means", "false": "What no means"}`. Each request supports up to 32 independent questions.
+Choice accepts 1–255 options, matching [Jev's Choice limit](https://docs.typesafe.ai/primitives/choice), subject to the tokenizer's valid single-token label capacity. Descriptions can be strings, JSON, or `null`; an empty or blank string or `null` uses the option name as its description. Score accepts 2–10 levels ordered from low to high. Noul optionally accepts `criteria: {"true": "What yes means", "false": "What no means"}`. Each request supports up to 32 independent questions.
 
 ActLogit uses Jev's three request and response structures with your local model. Its `confidence` is the maximum candidate probability; it does not reproduce Jev's confidence calculation or represent calibrated accuracy. Omit `model`, or set it to `actlogit`, `default`, or the configured model name. Token counts in `usage` are currently `null`.
 

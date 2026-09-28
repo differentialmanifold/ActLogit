@@ -9,7 +9,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from actlogit.config import Config
+from actlogit.config import Config, prompt_token_limit
 from actlogit.prompt import TokenLabels, render_prompt
 from actlogit.schema import DecisionRequest, DecisionResponse
 
@@ -58,7 +58,12 @@ class DecisionEngine:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         settings = config.model
+        path = Path(settings.name_or_path).expanduser()
+        if not path.is_dir():
+            raise ValueError(f"Transformers requires an existing local model directory: {path}")
         adapter = Path(settings.adapter_path) if settings.adapter_path else None
+        if adapter is not None and not adapter.is_dir():
+            raise ValueError(f"adapter requires an existing local directory: {adapter}")
         manifest = None
         if adapter:
             manifest_path = adapter / "actlogit.json"
@@ -76,7 +81,7 @@ class DecisionEngine:
                 raise ValueError(
                     "adapter requires the same base model and revision used for training"
                 )
-            if manifest["prompt"] != config.prompt.model_dump():
+            if manifest["prompt"] != config.prompt.signature():
                 raise ValueError(
                     "prompt configuration differs from the adapter training configuration"
                 )
@@ -92,17 +97,15 @@ class DecisionEngine:
         else:
             dtype = getattr(torch, settings.dtype)
         common = {
-            "local_files_only": settings.local_files_only,
+            "local_files_only": True,
             "trust_remote_code": settings.trust_remote_code,
             "revision": settings.revision,
         }
         tokenizer = AutoTokenizer.from_pretrained(
-            str(adapter) if adapter else settings.name_or_path,
+            str(adapter) if adapter else str(path),
             **{**common, "revision": None if adapter else settings.revision},
         )
-        model = AutoModelForCausalLM.from_pretrained(
-            settings.name_or_path, torch_dtype=dtype, **common
-        )
+        model = AutoModelForCausalLM.from_pretrained(str(path), torch_dtype=dtype, **common)
         if getattr(model.config, "is_encoder_decoder", False):
             raise ValueError("the local backend requires a decoder-only causal language model")
         model.to(device)
@@ -127,15 +130,16 @@ class DecisionEngine:
     def model_id(self) -> str:
         return self.config.model.name_or_path
 
-    def encode(self, request: DecisionRequest) -> EncodedDecision:
-        prompt, candidates, add_special_tokens = render_prompt(
-            request, self.tokenizer, self.codec, self.config.prompt
+    @property
+    def max_prompt_tokens(self) -> int:
+        return prompt_token_limit(
+            self.config.model.max_prompt_tokens, self.model.config.to_dict(), self.tokenizer
         )
-        ids = self.tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
-        limit = self.config.model.max_prompt_tokens
-        context_limit = getattr(self.model.config, "max_position_embeddings", None)
-        if isinstance(context_limit, int) and context_limit > 0:
-            limit = min(limit, context_limit)
+
+    def encode(self, request: DecisionRequest) -> EncodedDecision:
+        prompt, candidates, special = render_prompt(request, self.tokenizer, self.codec)
+        ids = self.tokenizer.encode(prompt, add_special_tokens=special)
+        limit = self.max_prompt_tokens
         if not ids or len(ids) > limit:
             raise ValueError(
                 f"decision prompt has {len(ids)} tokens; allowed 1..{limit}. "

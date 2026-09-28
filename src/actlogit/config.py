@@ -16,16 +16,34 @@ class ModelConfig(StrictModel):
     revision: str | None = None
     device: str = "auto"
     dtype: Literal["auto", "float32", "float16", "bfloat16"] = "auto"
-    local_files_only: bool = True
     trust_remote_code: bool = False
-    max_prompt_tokens: Annotated[int, Field(gt=0)] = 4096
+    max_prompt_tokens: Annotated[int | None, Field(gt=0)] = None
 
 
 class PromptConfig(StrictModel):
-    format: Literal["auto", "chat", "plain"] = "auto"
-    enable_thinking: bool = False
     # None discovers tokenizer-compatible labels; explicit labels must each be one token.
     labels: list[str] | None = None
+
+    def signature(self) -> dict:
+        # Record the fixed thinking mode alongside the configurable labels.
+        return {**self.model_dump(), "enable_thinking": False}
+
+
+def prompt_token_limit(configured: int | None, metadata: dict, tokenizer) -> int:
+    """Use the smallest explicit or advertised context limit, ignoring HF sentinels."""
+    limits = [configured] if configured is not None else []
+    text = metadata.get("text_config") or {}
+    for source in (metadata, text):
+        for key in ("max_position_embeddings", "n_positions", "max_seq_len"):
+            value = source.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and 0 < value < 10**9:
+                limits.append(value)
+    value = getattr(tokenizer, "model_max_length", None)
+    if isinstance(value, int) and 0 < value < 10**9:
+        limits.append(value)
+    if not limits:
+        raise ValueError("model context limit is unknown; set model.max_prompt_tokens explicitly")
+    return min(limits)
 
 
 class LoRAConfig(StrictModel):

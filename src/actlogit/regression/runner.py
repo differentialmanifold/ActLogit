@@ -99,7 +99,7 @@ class MLXEvaluator:
             enable_thinking=False,
         )
         tokens = engine.tokenizer.encode(prompt, add_special_tokens=False)
-        if not tokens or len(tokens) > engine.config.model.max_prompt_tokens:
+        if not tokens or len(tokens) > engine.max_prompt_tokens:
             raise ValueError(f"{record['id']}: {len(tokens)} prompt tokens exceed configuration")
         start = time.perf_counter()
         if record["task"] in {"mmlu", "cmmlu"}:
@@ -187,7 +187,7 @@ def run(args):
                 "temperature": 0,
                 "max_tokens": caps,
                 "max_prompt_tokens": config.model.max_prompt_tokens,
-                "loader_prompt_config": config.prompt.model_dump(),
+                "loader_prompt_config": config.prompt.signature(),
                 "mcq": "single-token-label-argmax",
                 "gsm8k": "strict-hash-numeric",
                 "humaneval": "full-code-chat-greedy-pass-at-1-macos-sandbox",

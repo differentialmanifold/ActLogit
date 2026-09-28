@@ -4,7 +4,7 @@
 
 **用本地语言模型做类型化决策，用离线目标分布微调。**
 
-ActLogit 为本地语言模型提供 Jev 风格的 `POST /v1/systemone` 接口，支持 **Choice、Noul、Score**，可在一次请求中组合多个问题。支持 Transformers（CUDA / MPS / CPU）和 MLX（Apple Silicon），以及基于离线数据的 **Forward KL + LoRA** 微调。
+ActLogit 为本地语言模型提供 Jev-compatible（接口兼容）的 `POST /v1/systemone` 接口，支持 **Choice、Noul、Score**，可在一次请求中组合多个问题。支持 Transformers（CUDA / MPS / CPU）和 MLX（Apple Silicon），以及基于离线数据的 **Forward KL + LoRA** 微调。
 
 ## 快速开始
 
@@ -24,12 +24,6 @@ cp -n configs/local.example.toml configs/local.toml
 name_or_path = "/absolute/path/to/model"
 device = "auto"
 dtype = "auto"
-local_files_only = true
-max_prompt_tokens = 4096
-
-[prompt]
-format = "auto"
-enable_thinking = false
 ```
 
 启动服务：
@@ -51,7 +45,11 @@ cp -n configs/mlx.example.toml configs/mlx.toml
 uv run actlogit serve --config configs/mlx.toml --port 8000
 ```
 
-模型需要是对应后端支持的文本生成模型。默认只读取本地权重；Transformers 也可填写 Hugging Face 模型 ID 并设置 `local_files_only = false`。
+模型必须放在已存在的本地目录中，并且是所选后端支持的文本生成模型。ActLogit 不负责下载模型权重。
+
+ActLogit 优先使用分词器的聊天模板并关闭思考，没有模板时自动使用普通文本提示词，无需配置提示词格式。请选择支持直接回答或非思考模式的模型。
+
+`model.max_prompt_tokens` 是可选项。省略时使用模型/分词器声明的上下文上限；也可设置较小的值（例如 `4096`）控制部署延迟和内存占用。实际限制取部署预算与模型上限的较小值，包含指令、state、候选项和模板 token。超长输入会明确拒绝，不会静默截断。模型未提供有效上下文信息时，需显式配置此项。
 
 ## 接口调用
 
@@ -98,7 +96,7 @@ curl http://127.0.0.1:8000/v1/systemone \
 | `noul` | `noul` | “是”的概率，范围 0–1；没有单独的 confidence |
 | `score` | `score`, `legend`, `probabilities`, `confidence` | 等级序号的概率加权平均；N 个等级对应 0–N−1，可为小数 |
 
-Choice 接受 1–255 个选项，描述可以是字符串、JSON 或 `null`；实际数量还受模型标签容量限制。Score 接受 2–10 个从低到高排列的等级。Noul 可选传入 `criteria: {"true": "是的条件", "false": "否的条件"}`。每次请求最多 32 个独立问题。
+Choice 接受 1–255 个选项，与 [Jev Choice 的限制](https://docs.typesafe.ai/primitives/choice)一致，实际数量还受分词器有效单 token 标签容量限制。描述可以是字符串、JSON 或 `null`；空字符串、空白字符串或 `null` 会使用选项名称作为描述。Score 接受 2–10 个从低到高排列的等级。Noul 可选传入 `criteria: {"true": "是的条件", "false": "否的条件"}`。每次请求最多 32 个独立问题。
 
 ActLogit 使用 Jev 的三种请求／响应结构，但运行你选择的本地模型；`confidence` 定义为最大候选概率，不复刻 Jev 的 confidence 算法，也不是校准后的正确率。`model` 可省略，或传入 `actlogit`、`default`、配置的模型名称。`usage` 中的 token 计数目前为 `null`。
 

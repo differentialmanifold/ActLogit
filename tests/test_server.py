@@ -103,6 +103,29 @@ def test_noul_without_criteria_and_one_choice():
     assert response.json()["answers"]["only"]["probabilities"] == {"one": 1.0}
 
 
+def test_choice_empty_descriptions_use_the_option_names():
+    engine = FakeEngine()
+    response = TestClient(create_app(engine)).post(
+        "/v1/systemone",
+        json={
+            "state": {"ticket": "answer the programming problems"},
+            "questions": {
+                "team": {
+                    "type": "choice",
+                    "instructions": "what's the best web development language",
+                    "criteria": {"java": "", "javascript": " ", "python": None},
+                }
+            },
+        },
+    )
+    assert response.status_code == 200
+    assert [(c.id, c.description) for c in engine.requests[0].choices] == [
+        ("java", "java"),
+        ("javascript", "javascript"),
+        ("python", "python"),
+    ]
+
+
 @pytest.mark.parametrize(
     "question",
     [
@@ -117,7 +140,7 @@ def test_noul_without_criteria_and_one_choice():
         {"type": "noul", "criteria": ["yes", "no"]},
         {"type": "choice", "criteria": {}},
         {"type": "choice", "criteria": {"": "Empty ID"}},
-        {"type": "choice", "criteria": {"yes": ""}},
+        {"type": "choice", "criteria": {" ": "Blank ID"}},
         {"type": "choice", "criteria": {str(i): None for i in range(256)}},
     ],
 )

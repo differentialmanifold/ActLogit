@@ -19,7 +19,7 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map
 
-from actlogit.config import Config
+from actlogit.config import Config, prompt_token_limit
 from actlogit.data import load_records, write_json
 from actlogit.prompt import TokenLabels, render_prompt
 from actlogit.schema import DecisionRequest, DecisionResponse
@@ -68,8 +68,9 @@ def install_lora(model, adapter_config):
 
 
 class MLXDecisionEngine:
-    def __init__(self, model, tokenizer, config):
+    def __init__(self, model, tokenizer, config, *, model_metadata=None):
         self.model, self.tokenizer, self.config = model, tokenizer, config
+        self._model_metadata = model_metadata or {}
         self.codec = TokenLabels.build(tokenizer, config.prompt.labels)
         self.model.eval()
 
@@ -94,7 +95,7 @@ class MLXDecisionEngine:
             if (
                 manifest["base_model"] != settings.name_or_path
                 or manifest["base_revision"] != settings.revision
-                or manifest["prompt"] != config.prompt.model_dump()
+                or manifest["prompt"] != config.prompt.signature()
             ):
                 raise ValueError("adapter base model/revision/prompt configuration mismatch")
         model, tokenizer = load(
@@ -104,7 +105,9 @@ class MLXDecisionEngine:
                 "trust_remote_code": settings.trust_remote_code,
             },
         )
-        engine = cls(model, tokenizer, config)
+        engine = cls(
+            model, tokenizer, config, model_metadata=json.loads((path / "config.json").read_text())
+        )
         if manifest:
             if manifest["labels"] != list(engine.codec.labels) or manifest["token_ids"] != list(
                 engine.codec.token_ids
@@ -128,12 +131,16 @@ class MLXDecisionEngine:
     def model_id(self):
         return self.config.model.name_or_path
 
-    def encode(self, request: DecisionRequest):
-        prompt, candidates, special = render_prompt(
-            request, self.tokenizer, self.codec, self.config.prompt
+    @property
+    def max_prompt_tokens(self):
+        return prompt_token_limit(
+            self.config.model.max_prompt_tokens, self._model_metadata, self.tokenizer
         )
+
+    def encode(self, request: DecisionRequest):
+        prompt, candidates, special = render_prompt(request, self.tokenizer, self.codec)
         ids = self.tokenizer.encode(prompt, add_special_tokens=special)
-        limit = self.config.model.max_prompt_tokens
+        limit = self.max_prompt_tokens
         if not ids or len(ids) > limit:
             raise ValueError(f"decision prompt has {len(ids)} tokens; allowed 1..{limit}")
         return EncodedDecision(ids, candidates)
@@ -248,7 +255,7 @@ def train(config: Config, *, log=True):
         "backend": "mlx",
         "base_model": config.model.name_or_path,
         "base_revision": config.model.revision,
-        "prompt": config.prompt.model_dump(),
+        "prompt": config.prompt.signature(),
         "labels": list(engine.codec.labels),
         "token_ids": list(engine.codec.token_ids),
         "objective": "forward_kl(target_action_distribution || model_action_distribution)",

@@ -2,12 +2,8 @@
 name_or_path = "./models/your-local-llm"
 device = "auto"
 dtype = "auto"
-local_files_only = true
-max_prompt_tokens = 4096
-
-[prompt]
-format = "auto"
-enable_thinking = false
+# Optional input budget; omit to use the model context limit.
+# max_prompt_tokens = 4096
 
 [lora]
 rank = 16

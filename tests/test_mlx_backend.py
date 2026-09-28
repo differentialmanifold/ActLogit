@@ -70,10 +70,10 @@ def test_real_mlx_training_reload_and_manifest(config, decision, choice_question
     response = reloaded.predict(decision)
     assert response.choice == winner
     assert set(response.probabilities) == set(target)
-    config.prompt.enable_thinking = True
+    config.prompt.labels = ["B", "A", "C", "D", "E"]
     with pytest.raises(ValueError, match="mismatch"):
         load_engine(config)
-    config.prompt.enable_thinking = False
+    config.prompt.labels = ["A", "B", "C", "D", "E"]
     manifest = tmp_path / "adapter" / "actlogit.json"
     value = json.loads(manifest.read_text())
     value["token_ids"][0] += 1

@@ -41,7 +41,7 @@ class DecisionResponse(StrictModel):
 
 
 def _description(value: JsonValue, fallback: str) -> str:
-    if value is None:
+    if value is None or (isinstance(value, str) and not value.strip()):
         return fallback
     if isinstance(value, str):
         return value
@@ -55,8 +55,8 @@ class ChoiceQuestion(StrictModel):
 
     @model_validator(mode="after")
     def usable_criteria(self) -> ChoiceQuestion:
-        if any(not key or value == "" for key, value in self.criteria.items()):
-            raise ValueError("criteria IDs and string descriptions must be nonempty")
+        if any(not key.strip() for key in self.criteria):
+            raise ValueError("criteria IDs must be nonempty")
         return self
 
     def to_decision(self, state: JsonValue) -> DecisionRequest:

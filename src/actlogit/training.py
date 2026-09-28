@@ -161,7 +161,7 @@ def train(config: Config, *, log: bool = True) -> dict[str, Any]:
         "format_version": 1,
         "base_model": config.model.name_or_path,
         "base_revision": config.model.revision,
-        "prompt": config.prompt.model_dump(),
+        "prompt": config.prompt.signature(),
         "labels": list(engine.codec.labels),
         "token_ids": list(engine.codec.token_ids),
         "objective": "forward_kl(target_action_distribution || model_action_distribution)",

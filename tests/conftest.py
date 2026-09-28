@@ -61,6 +61,10 @@ def tiny_model(tmp_path_factory):
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=tokenizer_impl, pad_token="[PAD]", unk_token="[UNK]", eos_token="[EOS]"
     )
+    tokenizer.chat_template = (
+        "{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n"
+        "{% endfor %}{% if add_generation_prompt %}assistant:\n{% endif %}"
+    )
     tokenizer.save_pretrained(path)
     model = LlamaForCausalLM(
         LlamaConfig(
@@ -84,7 +88,7 @@ def tiny_model(tmp_path_factory):
 def config(tiny_model):
     return Config(
         model=ModelConfig(name_or_path=str(tiny_model), device="cpu", dtype="float32"),
-        prompt=PromptConfig(format="plain", labels=["A", "B", "C", "D", "E"]),
+        prompt=PromptConfig(labels=["A", "B", "C", "D", "E"]),
     )
 
 

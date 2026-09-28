@@ -53,3 +53,28 @@ def test_candidate_logit_indices_are_exact(config, decision):
         output = engine.model(input_ids=torch.tensor([encoded.input_ids]), use_cache=False)
     assert mask.all()
     assert torch.allclose(logits[0], output.logits[0, -1, list(encoded.candidate_ids)], atol=1e-6)
+
+
+def test_optional_prompt_budget_respects_model_context(config, decision):
+    engine = DecisionEngine.load(config)
+    assert engine.max_prompt_tokens == 2048
+    config.model.max_prompt_tokens = 4096
+    assert engine.max_prompt_tokens == 2048
+    config.model.max_prompt_tokens = 128
+    assert engine.max_prompt_tokens == 128
+    config.model.max_prompt_tokens = None
+    engine.model.config.max_position_embeddings = 8
+    with pytest.raises(ValueError, match="allowed 1..8"):
+        engine.encode(decision)
+
+
+def test_transformers_rejects_remote_id_before_loading(config, monkeypatch):
+    from transformers import AutoModelForCausalLM
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("must not attempt to load or download a remote model")
+
+    monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", unexpected)
+    config.model.name_or_path = "does-not-exist/remote-model"
+    with pytest.raises(ValueError, match="existing local model directory"):
+        DecisionEngine.load(config)

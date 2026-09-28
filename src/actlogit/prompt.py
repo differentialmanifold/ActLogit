@@ -5,7 +5,6 @@ import string
 from dataclasses import dataclass
 from typing import Any
 
-from actlogit.config import PromptConfig
 from actlogit.schema import DecisionRequest
 
 SYSTEM_PROMPT = (
@@ -58,7 +57,7 @@ class TokenLabels:
 
 
 def render_prompt(
-    request: DecisionRequest, tokenizer: Any, codec: TokenLabels, config: PromptConfig
+    request: DecisionRequest, tokenizer: Any, codec: TokenLabels
 ) -> tuple[str, tuple[int, ...], bool]:
     labels, token_ids = codec.for_count(len(request.choices))
     body = json.dumps(
@@ -73,17 +72,12 @@ def render_prompt(
         ensure_ascii=False,
         allow_nan=False,
     )
-    use_chat = config.format == "chat" or (
-        config.format == "auto" and bool(tokenizer.chat_template)
+    if not tokenizer.chat_template:
+        return f"{SYSTEM_PROMPT}\n\n{body}\n\nChoice label:\n", token_ids, True
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": body}],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
     )
-    if use_chat:
-        if not tokenizer.chat_template:
-            raise ValueError("prompt.format=chat requires a tokenizer chat template")
-        rendered = tokenizer.apply_chat_template(
-            [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": body}],
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=config.enable_thinking,
-        )
-        return rendered, token_ids, False
-    return f"{SYSTEM_PROMPT}\n\n{body}\n\nChoice label:\n", token_ids, True
+    return rendered, token_ids, False
