@@ -14,7 +14,7 @@ from actlogit.systemone import predict
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="actlogit", description="Local single-token decisions and forward-KL LoRA training."
+        prog="actlogit", description="Local single-token decisions and policy distillation."
     )
     parser.add_argument("--version", action="version", version=__version__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -23,7 +23,7 @@ def main() -> None:
     register(commands)
     validate = commands.add_parser("validate-data", help="validate JSONL without loading a model")
     validate.add_argument("--data", required=True)
-    for name in ("predict", "train", "evaluate", "serve"):
+    for name in ("predict", "train", "train-online", "evaluate", "serve"):
         command = commands.add_parser(name)
         command.add_argument("--config", required=True)
         command.add_argument(
@@ -35,6 +35,12 @@ def main() -> None:
             )
         if name == "evaluate":
             command.add_argument("--data", required=True)
+        if name == "train-online":
+            command.add_argument("--resume", action="store_true")
+            command.add_argument(
+                "--rounds", type=int, help="total round budget, including saved rounds"
+            )
+            command.add_argument("--output-dir", help="override training.output_dir")
         if name == "serve":
             command.add_argument("--host", default="127.0.0.1")
             command.add_argument("--port", default=8000, type=int)
@@ -55,7 +61,21 @@ def main() -> None:
             config = load_config(args.config)
             if args.adapter:
                 config.model.adapter_path = args.adapter
-            if args.command == "train":
+            if args.command == "train-online":
+                from actlogit.config import Config
+                from actlogit.online import run
+
+                if args.rounds is not None:
+                    if config.online is None:
+                        raise ValueError("train-online needs [online]")
+                    config.online.rounds = args.rounds
+                if args.output_dir:
+                    if config.training is None:
+                        raise ValueError("train-online needs [training]")
+                    config.training.output_dir = args.output_dir
+                config = Config.model_validate(config.model_dump())
+                result = run(config, resume=args.resume)
+            elif args.command == "train":
                 from actlogit.backend import train
 
                 result = train(config)

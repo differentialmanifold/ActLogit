@@ -2,9 +2,9 @@
 
 [English](README.md) | **简体中文**
 
-**用本地语言模型做类型化决策，用离线目标分布微调。**
+**用本地语言模型做类型化决策，在学生自己产生的轨迹上向专家学习。**
 
-ActLogit 为本地语言模型提供 Jev-compatible（接口兼容）的 `POST /v1/systemone` 接口，支持 **Choice、Noul、Score**，可在一次请求中组合多个问题。支持 Transformers（CUDA / MPS / CPU）和 MLX（Apple Silicon），以及基于离线数据的 **Forward KL + LoRA** 微调。
+ActLogit 为本地语言模型提供 Jev-compatible（接口兼容）的 `POST /v1/systemone` 接口，支持 **Choice、Noul、Score**，可在一次请求中组合多个问题。支持 Transformers（CUDA / MPS / CPU）和 MLX（Apple Silicon），以及由应用提供环境和专家的**在线策略蒸馏**；同时兼容已有离线标签。
 
 ## 快速开始
 
@@ -110,53 +110,27 @@ ActLogit 使用 Jev 的三种请求／响应结构，但运行你选择的本地
 uv run actlogit predict --config configs/local.toml --input examples/systemone.json
 ```
 
-## 离线数据微调
+## 训练决策能力
 
-使用 **Forward KL + LoRA** 拟合目标概率分布。训练数据可来自人工标注、专家投票、搜索统计或教师模型；数据准备完成后，训练无需调用外部服务。
+直接从本地语言模型开始：学生独立完成一局/一个任务，专家标注学生访问的每个状态，
+再混合少量历史学生状态更新模型，无需专家预热数据。专家可以提供概率、投票、搜索访问
+次数或 one-hot 标签，通过稳定动作 ID 对齐；通用训练循环不绑定具体任务或模型。
 
-JSONL 每行包含 `state`、一个与接口定义相同的 `question`，以及该问题的目标分布 `target`：
-
-```json
-{"state":"Please refund the duplicate charge.","question":{"type":"noul","instructions":"Does the customer request a refund?"},"target":{"true":0.95,"false":0.05}}
-```
-
-| 问题类型 | `target` 的键 |
-|---|---|
-| Choice | `criteria` 中的所有选项 ID |
-| Noul | `"true"`、`"false"` |
-| Score | 等级序号字符串：`"0"`、`"1"`、… |
-
-目标可使用概率或非负计数，所有候选都必须提供，包括零权重项。硬标签可写成 one-hot 分布。完整三类示例见 [examples/train.jsonl](examples/train.jsonl)，数据要求和参数见 [微调指南](docs/training.zh-CN.md)。示例数据仅用于跑通流程，请替换为领域训练集和独立验证集。
-
-先复制训练配置模板：
+应用通过 [`configs/online.example.toml`](configs/online.example.toml) 配置环境与专家工厂。
+当前内置 MLX、Transformers 学习器使用 LoRA，并在轮间持续保留优化器。
 
 ```bash
-cp -n configs/train.example.toml configs/train.toml
+uv run actlogit train-online --config configs/online.toml
+uv run actlogit train-online --config configs/online.toml --resume
+uv run actlogit serve --config configs/online.toml --adapter outputs/online
 ```
 
-编辑 `configs/train.toml` 的模型路径、`training.data`、`training.eval_data` 和 `training.output_dir`，然后运行：
+运行前填写模型路径、应用工厂及其参数。接口协议、回放、独立验证和完整断点恢复见
+[通用训练方案](docs/training.zh-CN.md)。
 
-```bash
-uv run actlogit validate-data --data examples/train.jsonl
-uv run actlogit train --config configs/train.toml
-
-# 比较领域验证集上的基座与适配器
-uv run actlogit evaluate --config configs/local.toml --data examples/eval.jsonl
-uv run actlogit evaluate --config configs/local.toml \
-  --adapter outputs/domain-adapter --data examples/eval.jsonl
-
-# 使用微调后的模型启动服务
-uv run actlogit serve --config configs/local.toml \
-  --adapter outputs/domain-adapter --port 8000
-```
-
-MLX 微调先复制对应模板，再填写模型和数据路径：
-
-```bash
-cp -n configs/train-mlx.example.toml configs/train-mlx.toml
-```
-
-训练使用 `configs/train-mlx.toml`，评估和启动服务使用 `configs/mlx.toml`；其余命令相同。保持训练和推理的模型路径及 `[prompt]` 配置一致。
+已有 JSONL 标签可继续使用 `actlogit train --config configs/train.toml`，配置模板为
+`train.example.toml` 或 `train-mlx.example.toml`。每条记录包含 `state`、一个 API `question`
+及覆盖全部候选的 `target` 权重。格式示例见 [examples/train.jsonl](examples/train.jsonl)。
 
 ## 通用能力验证
 

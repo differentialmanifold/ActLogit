@@ -55,7 +55,7 @@ class LoRAConfig(StrictModel):
 
 
 class TrainingConfig(StrictModel):
-    data: str
+    data: str | None = None
     output_dir: str
     eval_data: str | None = None
     epochs: Annotated[int, Field(gt=0)] = 3
@@ -66,7 +66,27 @@ class TrainingConfig(StrictModel):
     max_grad_norm: Annotated[float, Field(gt=0)] = 1.0
     max_steps: Annotated[int | None, Field(gt=0)] = None
     gradient_checkpointing: bool = False
+    mlx_fast_frozen_prefix: bool = False
+    mlx_chunked_gated_delta: bool = False
+    mlx_batching: bool = False
+    mlx_clear_cache_interval: Annotated[int, Field(ge=0)] = 25
     seed: int = 42
+
+
+class OnlineConfig(StrictModel):
+    environment: str  # importable module:factory, called with environment_options
+    teacher: str  # importable module:factory, called with teacher_options
+    environment_options: dict = Field(default_factory=dict)
+    teacher_options: dict = Field(default_factory=dict)
+    rounds: Annotated[int, Field(gt=0)] = 20
+    max_episode_steps: Annotated[int | None, Field(gt=0)] = None
+    replay_capacity: Annotated[int, Field(ge=0)] = 10000
+    replay_fraction: Annotated[float, Field(ge=0, lt=1)] = 0.2
+    teacher_batch_size: Annotated[int, Field(gt=0)] = 64
+    sample_actions: bool = True
+    eval_every: Annotated[int, Field(ge=0)] = 5
+    eval_episodes: Annotated[int, Field(gt=0)] = 5
+    eval_seed: int = 1000000000
 
 
 class Config(StrictModel):
@@ -74,6 +94,7 @@ class Config(StrictModel):
     prompt: PromptConfig = Field(default_factory=PromptConfig)
     lora: LoRAConfig = Field(default_factory=LoRAConfig)
     training: TrainingConfig | None = None
+    online: OnlineConfig | None = None
 
 
 def load_config(path: str | Path) -> Config:

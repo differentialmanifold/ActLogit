@@ -20,3 +20,9 @@ batch_size = 1
 gradient_accumulation_steps = 8
 learning_rate = 0.0001
 seed = 42
+
+# Qwen3.5 only; validate on your model before enabling.
+mlx_chunked_gated_delta = false
+mlx_fast_frozen_prefix = false
+mlx_batching = false
+mlx_clear_cache_interval = 25

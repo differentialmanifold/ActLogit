@@ -2,9 +2,9 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-**Run typed decisions with local LLMs. Fine-tune with offline distributions.**
+**Run typed decisions with local LLMs. Learn from experts on student-generated trajectories.**
 
-ActLogit provides a Jev-compatible `POST /v1/systemone` API for local language models, with **Choice, Noul, and Score** questions in a single request. It supports Transformers (CUDA / MPS / CPU), MLX (Apple Silicon), and offline **Forward KL + LoRA** fine-tuning.
+ActLogit provides a Jev-compatible `POST /v1/systemone` API for local language models, with **Choice, Noul, and Score** questions in a single request. It supports Transformers (CUDA / MPS / CPU), MLX (Apple Silicon), and **online policy distillation** with application-provided environments and experts. Existing offline labels remain supported.
 
 ## Quick start
 
@@ -110,53 +110,29 @@ Use the same request file without starting a server:
 uv run actlogit predict --config configs/local.toml --input examples/systemone.json
 ```
 
-## Fine-tune with offline data
+## Train decision policies
 
-Train with **Forward KL + LoRA** to match target probability distributions. Targets can come from human labels, expert votes, search statistics, or teacher models. Once the data is prepared, training requires no external model service.
+Start directly from a local model: the student completes an episode, an expert labels each visited
+state, and ActLogit updates the student with a small amount of historical replay. No warm-up dataset
+is required. Experts return probabilities, votes, search visit counts or one-hot labels over stable
+choice IDs; model architecture and task logic stay outside the generic loop.
 
-Each JSONL line contains `state`, one `question` using the API's question definition, and its `target` distribution:
-
-```json
-{"state":"Please refund the duplicate charge.","question":{"type":"noul","instructions":"Does the customer request a refund?"},"target":{"true":0.95,"false":0.05}}
-```
-
-| Question type | Keys in `target` |
-|---|---|
-| Choice | Every option ID from `criteria` |
-| Noul | `"true"` and `"false"` |
-| Score | Level indices as strings: `"0"`, `"1"`, … |
-
-Targets may be probabilities or nonnegative counts. Include every outcome, including zero-weight ones. Hard labels can use one-hot distributions. See [examples/train.jsonl](examples/train.jsonl) for all three types and the [fine-tuning guide](docs/training.md) for data requirements and settings. The example data demonstrates the format; replace it with your domain training set and a separate validation set.
-
-Copy the training configuration:
+Applications provide environment and teacher factories through
+[`configs/online.example.toml`](configs/online.example.toml). The built-in MLX and Transformers
+learners use LoRA and keep optimizer state across rounds.
 
 ```bash
-cp -n configs/train.example.toml configs/train.toml
+uv run actlogit train-online --config configs/online.toml
+uv run actlogit train-online --config configs/online.toml --resume
+uv run actlogit serve --config configs/online.toml --adapter outputs/online
 ```
 
-Edit the model path, `training.data`, `training.eval_data`, and `training.output_dir` in `configs/train.toml`, then run:
+See the [training guide](docs/training.md) for protocols, replay, held-out evaluation and full
+checkpoint recovery. The model path and application factories must be configured before running.
 
-```bash
-uv run actlogit validate-data --data examples/train.jsonl
-uv run actlogit train --config configs/train.toml
-
-# Compare the base model and adapter on your domain validation set
-uv run actlogit evaluate --config configs/local.toml --data examples/eval.jsonl
-uv run actlogit evaluate --config configs/local.toml \
-  --adapter outputs/domain-adapter --data examples/eval.jsonl
-
-# Serve the fine-tuned model
-uv run actlogit serve --config configs/local.toml \
-  --adapter outputs/domain-adapter --port 8000
-```
-
-For MLX fine-tuning, copy its template and set the model and data paths:
-
-```bash
-cp -n configs/train-mlx.example.toml configs/train-mlx.toml
-```
-
-Use `configs/train-mlx.toml` for training and `configs/mlx.toml` for evaluation and serving. The commands are otherwise the same. Keep the model path and `[prompt]` settings consistent between training and inference.
+Existing JSONL labels can use `actlogit train --config configs/train.toml` with the
+`train.example.toml` or `train-mlx.example.toml` template. Each record contains `state`, one API
+`question`, and `target` weights for every outcome. See [examples/train.jsonl](examples/train.jsonl).
 
 ## General capability evaluation
 

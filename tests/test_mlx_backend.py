@@ -176,3 +176,178 @@ def test_real_mlx_model_through_http_worker(config, decision, choice_question):
     assert response.json()["answers"]["team"]["probabilities"] == pytest.approx(
         expected.probabilities
     )
+
+
+def tiny_qwen():
+    from mlx_lm.models.qwen3_5 import Model, ModelArgs
+
+    mx.random.seed(21)
+    model = Model(
+        ModelArgs(
+            model_type="qwen3_5",
+            text_config={
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 8,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 8,
+                "vocab_size": 40,
+                "linear_num_value_heads": 1,
+                "linear_num_key_heads": 1,
+                "linear_key_head_dim": 32,
+                "linear_value_head_dim": 32,
+            },
+        )
+    )
+    install_lora(
+        model, {"num_layers": 4, "lora_parameters": {"rank": 4, "scale": 2, "dropout": 0.0}}
+    )
+    # A trained adapter, not all-zero B matrices: exercise both A and B gradients.
+    for name, value in tree_flatten(model.trainable_parameters()):
+        if name.endswith("lora_b"):
+            model.load_weights([(name, 0.03 * mx.random.normal(value.shape))], strict=False)
+    mx.eval(model.parameters())
+    return model
+
+
+def test_qwen_right_padding_and_fast_prefix_preserve_logits_and_weighted_gradients():
+    import mlx.nn as nn
+
+    from actlogit.mlx_backend import (
+        EncodedDecision,
+        candidate_logits_batch,
+        set_training_mode,
+    )
+
+    model = tiny_qwen()
+    examples = [
+        EncodedDecision([3, 7, 4, 10, 2], (8, 11, 19)),
+        EncodedDecision([2, 4, 9], (3, 7, 12)),
+        EncodedDecision([2, 1, 8, 9, 2, 3, 4], (4, 5, 6)),
+    ]
+    targets = mx.array([[0.2, 0.8, 0], [0, 1, 0], [0.1, 0.3, 0.6]])
+    weights = mx.array([1 / 6, 2 / 6, 3 / 6])
+
+    def serial(m):
+        return sum(
+            loss_terms(candidate_logits(m, e), targets[i])[0] * weights[i]
+            for i, e in enumerate(examples)
+        )
+
+    model.train()
+    expected_logits = mx.stack([candidate_logits(model, e) for e in examples])
+    old_loss, old_grads = nn.value_and_grad(model, serial)(model)
+    mx.eval(expected_logits, old_loss, old_grads)
+    assert set_training_mode(model) == 4
+    assert all(not layer.training for layer in model.layers[:4])
+    assert all(layer.training for layer in model.layers[4:])
+    logits = candidate_logits_batch(model, examples)
+    loss, grads = nn.value_and_grad(
+        model,
+        lambda m: mx.sum(loss_terms(candidate_logits_batch(m, examples), targets)[0] * weights),
+    )(model)
+    mx.eval(logits, loss, grads)
+    assert mx.allclose(logits, expected_logits, atol=2e-5, rtol=2e-4).item()
+    assert loss.item() == pytest.approx(old_loss.item(), abs=2e-5)
+    old_grads, grads = dict(tree_flatten(old_grads)), dict(tree_flatten(grads))
+    assert old_grads.keys() == grads.keys()
+    for name in grads:
+        assert mx.allclose(grads[name], old_grads[name], atol=2e-5, rtol=2e-3).item(), name
+
+
+def test_fast_prefix_stops_before_any_trainable_block_and_embedding():
+    from actlogit.mlx_backend import set_training_mode
+
+    model = tiny_qwen()
+    model.layers[1].unfreeze()
+    assert set_training_mode(model) == 1
+    assert all(layer.training for layer in model.layers[1:])
+    model.language_model.model.embed_tokens.unfreeze()
+    assert set_training_mode(model) == 0
+    assert all(layer.training for layer in model.layers)
+
+
+def test_real_microbatch_training_matches_accumulation_including_weighted_tail(
+    config,
+    choice_question,
+    tmp_path,
+):
+    config.model.backend, config.model.device, config.model.dtype = "mlx", "auto", "auto"
+    config.lora = LoRAConfig(rank=4, alpha=8, num_layers=1)
+    records = [
+        TrainingRecord(
+            state="refund " * (1 + i % 3),
+            question=choice_question,
+            target={"billing": 0.1, "technical": 0.8, "account": 0.1},
+            weight=i + 1,
+        )
+        for i in range(9)
+    ]
+    data = tmp_path / "weighted.jsonl"
+    data.write_text("".join(r.model_dump_json() + "\n" for r in records))
+    outputs = []
+    for batch, accumulation in [(1, 8), (4, 2)]:
+        output = tmp_path / f"batch-{batch}"
+        config.training = TrainingConfig(
+            data=str(data),
+            output_dir=str(output),
+            epochs=1,
+            batch_size=batch,
+            mlx_batching=True,
+            gradient_accumulation_steps=accumulation,
+            seed=42,
+        )
+        report = train(config, log=False)
+        assert report["steps"] == 2
+        assert [r["examples"] for r in report["history"]] == [8, 1]
+        assert sum(r["examples"] for r in report["history"]) == 9
+        outputs.append(mx.load(str(output / "adapters.safetensors")))
+    for name in outputs[0]:
+        assert mx.allclose(outputs[0][name], outputs[1][name], atol=2e-6, rtol=2e-4).item()
+
+
+def test_microbatches_keep_optimizer_windows_and_mixed_candidate_counts():
+    from types import SimpleNamespace
+
+    from actlogit.mlx_backend import EncodedDecision, microbatches
+
+    items = [
+        EncodedDecision([1] * length, tuple(range(count)))
+        for length, count in [(3, 4), (5, 4), (4, 2), (6, 4), (3, 4)]
+    ]
+    window = [3, 0, 2, 1, 4]
+    batches = list(microbatches(SimpleNamespace(model_type="qwen3_5"), window, items, 4))
+    assert sorted(i for b in batches for i in b) == sorted(window)
+    assert all(len({len(items[i].candidate_ids) for i in b}) == 1 for b in batches)
+    assert batches == [[3, 0, 1], [2], [4]]
+
+
+def test_chunked_qwen_model_gradients_and_inference_are_preserved():
+    import mlx.nn as nn
+
+    from actlogit.mlx_backend import EncodedDecision, set_training_mode
+    from actlogit.mlx_delta import training_delta_context
+
+    model = tiny_qwen()
+    example = EncodedDecision(([3, 7, 4, 10, 2] * 14)[:67], (8, 11, 19))
+
+    def objective(m):
+        return loss_terms(candidate_logits(m, example), mx.array([0.2, 0.8, 0.0]))[0]
+
+    model.train()
+    old_loss, old_grad = nn.value_and_grad(model, objective)(model)
+    mx.eval(old_loss, old_grad)
+    for fast_prefix in (False, True):
+        set_training_mode(model, fast_frozen_prefix=fast_prefix)
+        with training_delta_context(model, True):
+            loss, grad = nn.value_and_grad(model, objective)(model)
+            mx.eval(loss, grad)
+        assert abs(loss.item() - old_loss.item()) < 1e-5
+        for (name, a), (_, b) in zip(tree_flatten(old_grad), tree_flatten(grad), strict=True):
+            assert mx.allclose(a, b, atol=3e-5, rtol=3e-3).item(), name
+    model.eval()
+    before = candidate_logits(model, example)
+    with training_delta_context(model, True):
+        after = candidate_logits(model, example)
+    assert mx.array_equal(before, after).item()

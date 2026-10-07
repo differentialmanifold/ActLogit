@@ -1,8 +1,8 @@
 """Local MLX single-token decisions and weighted forward-KL LoRA training.
 
-Each micro-example uses its true sequence length, including hybrid recurrent
-models where padding without a matching recurrent mask would change the state.
-Batch size controls the accumulation window, not padded model execution.
+Microbatches share a model forward/backward. Qwen3.5 uses right padding and
+gathers each sample's last real token; other models batch only equal lengths.
+Only the frozen prefix before the first trainable block can use inference kernels.
 """
 
 from __future__ import annotations
@@ -17,12 +17,14 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-from mlx.utils import tree_flatten, tree_map
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 from actlogit.config import Config, prompt_token_limit
-from actlogit.data import load_records, write_json
+from actlogit.data import write_json
+from actlogit.mlx_delta import training_delta_context
 from actlogit.prompt import TokenLabels, render_prompt
 from actlogit.schema import DecisionRequest, DecisionResponse
+from actlogit.trainer import resolve_adapter, tuples, write_manifest
 
 
 @dataclass
@@ -48,11 +50,74 @@ def candidate_logits(model, encoded):
 
 
 def loss_terms(logits, target):
-    logp = logits - mx.logsumexp(logits)
+    logp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
     logq = mx.log(mx.maximum(target, 1e-30))
-    ce = -mx.sum(target * logp)
-    entropy = -mx.sum(target * logq)
+    ce = -mx.sum(target * logp, axis=-1)
+    entropy = -mx.sum(target * logq, axis=-1)
     return ce - entropy, ce, entropy
+
+
+def candidate_logits_batch(model, encoded):
+    """No left padding or shared recurrent cache; padding never precedes a real token."""
+    if not encoded or any(not item.input_ids or not item.candidate_ids for item in encoded):
+        raise ValueError("batch needs nonempty sequences and candidates")
+    if len({len(item.candidate_ids) for item in encoded}) != 1:
+        raise ValueError("a microbatch must have the same number of candidates")
+    if len(encoded) == 1:
+        return candidate_logits(model, encoded[0])[None, :]
+    qwen = getattr(model, "model_type", None) in {"qwen3_5", "qwen3_5_moe"}
+    lengths = [len(item.input_ids) for item in encoded]
+    if not qwen and len(set(lengths)) != 1:
+        raise ValueError("unequal-length batching is supported only for Qwen3.5")
+    width = max(lengths)
+    # Qwen's attention and convolution/recurrent operations are causal. Gather BEFORE
+    # right padding; no padded state is reused by another request or training batch.
+    inputs = mx.array([item.input_ids + [0] * (width - len(item.input_ids)) for item in encoded])
+    batch_indices = mx.arange(len(encoded))
+    positions = mx.array(lengths) - 1
+    if qwen:
+        language = model.language_model
+        hidden = language.model(inputs)[batch_indices, positions][:, None, :]
+        if language.args.tie_word_embeddings:
+            logits = language.model.embed_tokens.as_linear(hidden)
+        else:
+            logits = language.lm_head(hidden)
+        logits = logits[:, 0, :]
+    else:
+        logits = model(inputs)[batch_indices, positions]
+    candidates = mx.array([item.candidate_ids for item in encoded])
+    return mx.take_along_axis(logits, candidates, axis=-1).astype(mx.float32)
+
+
+def set_training_mode(model, *, fast_frozen_prefix=True):
+    """Keep gradients through every block at/after the FIRST trainable block."""
+    model.train()
+    if not fast_frozen_prefix or getattr(model, "model_type", None) not in {
+        "qwen3_5",
+        "qwen3_5_moe",
+    }:
+        return 0
+    if tree_flatten(model.language_model.model.embed_tokens.trainable_parameters()):
+        return 0  # Gradients to trainable input embeddings must traverse all blocks.
+    count = 0
+    for layer in model.layers:
+        if tree_flatten(layer.trainable_parameters()):
+            break
+        layer.eval()
+        count += 1
+    return count
+
+
+def microbatches(model, window, encoded, batch_size):
+    """Partition a window without dropping, repeating or moving samples to another window."""
+    qwen = getattr(model, "model_type", None) in {"qwen3_5", "qwen3_5_moe"}
+    for start in range(0, len(window), batch_size):
+        groups = {}
+        for index in window[start : start + batch_size]:
+            item = encoded[index]
+            key = (len(item.candidate_ids), None if qwen else len(item.input_ids))
+            groups.setdefault(key, []).append(index)
+        yield from groups.values()
 
 
 def install_lora(model, adapter_config):
@@ -78,7 +143,9 @@ class MLXDecisionEngine:
     def load(cls, config: Config, *, trainable_adapter=False):
         from mlx_lm import load
 
-        settings = config.model
+        settings = config.model.model_copy()
+        if settings.adapter_path:
+            settings.adapter_path = resolve_adapter(settings.adapter_path)
         path = Path(settings.name_or_path).expanduser()
         # This backend is explicitly local: never download an accidental repo ID.
         if not path.is_dir():
@@ -201,135 +268,156 @@ def evaluate_records(engine, records, batch_size=4):
     return {key: value / denominator for key, value in totals.items()}
 
 
-def train(config: Config, *, log=True):
-    settings = config.training
-    if settings is None:
-        raise ValueError("configuration needs a [training] section")
-    output = Path(settings.output_dir)
-    if output.exists() and any(output.iterdir()):
-        raise ValueError(f"output directory is not empty: {output}")
-    records = load_records(settings.data)
-    validation = load_records(settings.eval_data) if settings.eval_data else records
-    mx.random.seed(settings.seed)
-    engine = MLXDecisionEngine.load(config, trainable_adapter=True)
-    if config.model.adapter_path:
-        adapter_config = json.loads(
-            (Path(config.model.adapter_path) / "adapter_config.json").read_text()
+class MLXTrainer:
+    """Persistent MLX learner; fit() never reloads the model or resets Adam."""
+
+    def __init__(self, config):
+        self.config, self.settings = config, config.training
+        mx.random.seed(self.settings.seed)
+        self.rng = random.Random(self.settings.seed)
+        self.step = 0
+        self.engine = MLXDecisionEngine.load(config, trainable_adapter=True)
+        if config.model.adapter_path:
+            self.adapter_config = json.loads(
+                (Path(config.model.adapter_path) / "adapter_config.json").read_text()
+            )
+        else:
+            targets = config.lora.target_modules
+            if isinstance(targets, str) and targets != "all-linear":
+                raise ValueError("MLX target_modules must be all-linear or module paths")
+            self.adapter_config = {
+                "fine_tune_type": "lora",
+                "num_layers": config.lora.num_layers or len(self.engine.model.layers),
+                "lora_parameters": {
+                    "rank": config.lora.rank,
+                    "scale": config.lora.alpha / config.lora.rank,
+                    "dropout": config.lora.dropout,
+                    **({"keys": targets} if isinstance(targets, list) else {}),
+                },
+            }
+            install_lora(self.engine.model, self.adapter_config)
+        if self.settings.gradient_checkpointing:
+            from mlx_lm.tuner.trainer import grad_checkpoint
+
+            grad_checkpoint(self.engine.model.layers[-1])
+        self.optimizer = optim.AdamW(
+            self.settings.learning_rate, weight_decay=self.settings.weight_decay
         )
-    else:
-        targets = config.lora.target_modules
-        if isinstance(targets, str) and targets != "all-linear":
-            raise ValueError("MLX target_modules must be all-linear or a list of module paths")
-        adapter_config = {
-            "fine_tune_type": "lora",
-            "num_layers": config.lora.num_layers or len(engine.model.layers),
-            "lora_parameters": {
-                "rank": config.lora.rank,
-                "scale": config.lora.alpha / config.lora.rank,
-                "dropout": config.lora.dropout,
-                **({"keys": targets} if isinstance(targets, list) else {}),
-            },
+        self.execution = {}
+        self.engine.model.eval()
+
+    @property
+    def trainable_parameters(self):
+        return sum(v.size for _, v in tree_flatten(self.engine.model.trainable_parameters()))
+
+    def fit(self, records, *, emit=None):
+        if not records:
+            raise ValueError("training needs at least one record")
+        settings, model = self.settings, self.engine.model
+        encoded = [self.engine.encode(record.decision) for record in records]
+        window_size = settings.batch_size * settings.gradient_accumulation_steps
+        microbatch_size = settings.batch_size if settings.mlx_batching else 1
+        frozen = set_training_mode(model, fast_frozen_prefix=settings.mlx_fast_frozen_prefix)
+        self.execution = {
+            "fast_frozen_prefix_layers": frozen,
+            "microbatch_size": microbatch_size,
+            "chunked_gated_delta": settings.mlx_chunked_gated_delta,
+            "effective_batch_size": window_size,
+            "clear_cache_interval": settings.mlx_clear_cache_interval,
         }
-        install_lora(engine.model, adapter_config)
-    encoded = [engine.encode(record.decision) for record in records]
-    for record in validation:
-        engine.encode(record.decision)
-    if log:
-        print(json.dumps({"phase": "validation_before", "records": len(validation)}), flush=True)
-    before = evaluate_records(engine, validation)
-    if settings.gradient_checkpointing:
-        from mlx_lm.tuner.trainer import grad_checkpoint
 
-        grad_checkpoint(engine.model.layers[-1])
-    optimizer = optim.AdamW(settings.learning_rate, weight_decay=settings.weight_decay)
+        def objective(m, items, target, weights):
+            return mx.sum(loss_terms(candidate_logits_batch(m, items), target)[0] * weights)
 
-    def objective(model, item, target):
-        return loss_terms(candidate_logits(model, item), target)[0]
+        value_and_grad = nn.value_and_grad(model, objective)
+        history, started = [], time.perf_counter()
+        try:
+            with training_delta_context(model, settings.mlx_chunked_gated_delta):
+                for epoch in range(settings.epochs):
+                    indices = list(range(len(records)))
+                    self.rng.shuffle(indices)
+                    for offset in range(0, len(indices), window_size):
+                        update_started = time.perf_counter()
+                        window = indices[offset : offset + window_size]
+                        denominator = math.fsum(records[i].weight for i in window)
+                        grads, loss_sum, batch_count = None, 0.0, 0
+                        for micro in microbatches(model, window, encoded, microbatch_size):
+                            loss, grad = value_and_grad(
+                                model,
+                                [encoded[i] for i in micro],
+                                mx.array([records[i].distribution() for i in micro]),
+                                mx.array([records[i].weight / denominator for i in micro]),
+                            )
+                            grads = (
+                                grad if grads is None else tree_map(lambda a, b: a + b, grads, grad)
+                            )
+                            mx.eval(loss, grads)
+                            loss_sum += loss.item()
+                            batch_count += 1
+                        grads, norm = optim.clip_grad_norm(grads, settings.max_grad_norm)
+                        if not math.isfinite(loss_sum) or not math.isfinite(norm.item()):
+                            raise ValueError(
+                                "nonfinite loss/gradient; check model precision and data"
+                            )
+                        self.optimizer.update(model, grads)
+                        mx.eval(model.parameters(), self.optimizer.state)
+                        self.step += 1
+                        metrics = {
+                            "step": self.step,
+                            "epoch": epoch + 1,
+                            "forward_kl": loss_sum,
+                            "gradient_norm": norm.item(),
+                            "seconds": time.perf_counter() - started,
+                            "update_seconds": time.perf_counter() - update_started,
+                            "peak_memory_gib": mx.get_peak_memory() / 2**30,
+                            "examples": len(window),
+                            "microbatches": batch_count,
+                        }
+                        history.append(metrics)
+                        if emit:
+                            emit(metrics)
+                        if (
+                            settings.mlx_clear_cache_interval
+                            and self.step % settings.mlx_clear_cache_interval == 0
+                        ):
+                            mx.clear_cache()
+                        if settings.max_steps and len(history) >= settings.max_steps:
+                            return history
+        finally:
+            model.eval()
+        return history
 
-    value_and_grad = nn.value_and_grad(engine.model, objective)
-    window_size = settings.batch_size * settings.gradient_accumulation_steps
-    rng = random.Random(settings.seed)
-    output.mkdir(parents=True, exist_ok=True)
-    manifest = {
-        "format_version": 1,
-        "backend": "mlx",
-        "base_model": config.model.name_or_path,
-        "base_revision": config.model.revision,
-        "prompt": config.prompt.signature(),
-        "labels": list(engine.codec.labels),
-        "token_ids": list(engine.codec.token_ids),
-        "objective": "forward_kl(target_action_distribution || model_action_distribution)",
-        "normalization": "all_legal_actions",
-    }
-    write_json(output / "actlogit.json", manifest)
-    write_json(output / "adapter_config.json", adapter_config)
-    write_json(output / "training_config.json", config.model_dump())
-    history = []
-    start = time.perf_counter()
-    engine.model.train()
-    with (output / "training.jsonl").open("w") as events:
-        for epoch in range(settings.epochs):
-            indices = list(range(len(records)))
-            rng.shuffle(indices)
-            for offset in range(0, len(indices), window_size):
-                window = indices[offset : offset + window_size]
-                denominator = math.fsum(records[i].weight for i in window)
-                grads, loss_sum = None, 0.0
-                for index in window:
-                    loss, grad = value_and_grad(
-                        engine.model, encoded[index], mx.array(records[index].distribution())
-                    )
-                    weight = records[index].weight / denominator
-                    grad = tree_map(lambda g, weight=weight: g * weight, grad)
-                    grads = grad if grads is None else tree_map(lambda a, b: a + b, grads, grad)
-                    mx.eval(loss, grads)
-                    loss_sum += loss.item() * weight
-                grads, norm = optim.clip_grad_norm(grads, settings.max_grad_norm)
-                if not math.isfinite(loss_sum) or not math.isfinite(norm.item()):
-                    raise ValueError("nonfinite loss/gradient; check model precision and data")
-                optimizer.update(engine.model, grads)
-                mx.eval(engine.model.parameters(), optimizer.state)
-                metrics = {
-                    "step": len(history) + 1,
-                    "epoch": epoch + 1,
-                    "forward_kl": loss_sum,
-                    "gradient_norm": norm.item(),
-                    "seconds": time.perf_counter() - start,
-                }
-                history.append(metrics)
-                events.write(json.dumps(metrics) + "\n")
-                events.flush()
-                if log:
-                    print(json.dumps(metrics), flush=True)
-                if len(history) % 25 == 0:
-                    mx.save_safetensors(
-                        str(output / "partial.safetensors"),
-                        dict(tree_flatten(engine.model.trainable_parameters())),
-                    )
-                mx.clear_cache()
-                if settings.max_steps and len(history) >= settings.max_steps:
-                    break
-            if settings.max_steps and len(history) >= settings.max_steps:
-                break
-    engine.model.eval()
-    mx.save_safetensors(
-        str(output / "adapters.safetensors"),
-        dict(tree_flatten(engine.model.trainable_parameters())),
-    )
-    if log:
-        print(json.dumps({"phase": "validation_after", "records": len(validation)}), flush=True)
-    after = evaluate_records(engine, validation)
-    report = {
-        "backend": "mlx",
-        "steps": len(history),
-        "examples": len(records),
-        "trainable_parameters": sum(
-            v.size for _, v in tree_flatten(engine.model.trainable_parameters())
-        ),
-        "evaluation_split": "held_out" if settings.eval_data else "training",
-        "before": before,
-        "after": after,
-        "history": history,
-    }
-    write_json(output / "metrics.json", report)
-    return report
+    def save_adapter(self, path):
+        path = Path(path)
+        write_manifest(path, self.engine)
+        write_json(path / "adapter_config.json", self.adapter_config)
+        mx.save_safetensors(
+            str(path / "adapters.safetensors"),
+            dict(tree_flatten(self.engine.model.trainable_parameters())),
+        )
+
+    def save_state(self, path):
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        mx.eval(self.optimizer.state, mx.random.state[0])
+        mx.savez(
+            str(path / "optimizer.npz"),
+            **dict(tree_flatten(self.optimizer.state)),
+            rng=mx.random.state[0],
+        )
+        write_json(path / "trainer.json", {"step": self.step, "rng": self.rng.getstate()})
+
+    def load_state(self, path):
+        path = Path(path)
+        arrays = mx.load(str(path / "optimizer.npz"))
+        mx.random.state[0][:] = arrays.pop("rng")
+        self.optimizer.state = tree_unflatten(list(arrays.items()))
+        state = json.loads((path / "trainer.json").read_text())
+        self.step = state["step"]
+        self.rng.setstate(tuples(state["rng"]))
+
+
+def train(config: Config, *, log=True):
+    from actlogit.trainer import train_files
+
+    return train_files(config, log=log)

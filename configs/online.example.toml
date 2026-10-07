@@ -1,0 +1,34 @@
+[model]
+name_or_path = "/absolute/path/to/your/local/model"
+backend = "mlx" # or transformers, with the corresponding local model and dependencies
+
+[lora]
+rank = 16
+alpha = 32
+dropout = 0.0
+target_modules = "all-linear"
+
+[training]
+output_dir = "outputs/online"
+epochs = 1 # passes over each round's new + replayed examples
+batch_size = 1
+gradient_accumulation_steps = 8
+learning_rate = 0.00002
+seed = 42
+
+[online]
+environment = "your_project.actlogit:make_environment"
+teacher = "your_project.actlogit:make_teacher"
+rounds = 20 # total completed student episodes, not additional rounds on resume
+replay_capacity = 10000
+replay_fraction = 0.2
+teacher_batch_size = 64
+sample_actions = true
+eval_every = 5 # 0 disables independent evaluation
+eval_episodes = 5
+eval_seed = 1000000000
+
+# Factories receive these optional application-owned keyword arguments.
+[online.environment_options]
+
+[online.teacher_options]

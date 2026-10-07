@@ -1,93 +1,137 @@
-# 微调指南
+# 通用在线策略蒸馏
 
-[English](training.md) | **简体中文** · [返回 README](../README.zh-CN.md)
+[English](training.md) · [返回 README](../README.zh-CN.md)
 
-ActLogit 使用离线 JSONL 数据训练 LoRA 适配器。Choice、Noul、Score 可混合在同一个数据集中，训练与接口使用相同的问题定义。
+ActLogit 训练语言模型在当前状态下选择动作。训练方案不指定模型、任务、候选数量或专家算法。
+应用提供环境和专家；ActLogit 负责学生决策、分布监督、历史回放、参数更新与恢复。
+当前内置参数更新器使用 MLX 或 Transformers 的 LoRA；在线蒸馏协议与参数更新方式独立，
+它不意味着已经支持量化基座全参数训练。
 
-## 准备数据
+## 训练循环
 
-每行一个样本：
+1. 从配置的本地语言模型开始，不要求专家数据集或预热。也可显式加载已有 adapter。
+2. 固定当前学生参数，让学生独立完成一局/一个任务，保存每次执行动作前的状态。
+3. 专家批量标注学生访问的所有状态，包括失误和失败任务，返回各动作的非负权重。
+4. 第一轮只使用新状态；后续混合新状态与历史学生状态。默认历史样本占比目标为 20%，
+   历史不足时使用现有数量、不重复补齐。容量受限的 reservoir 回放池保留跨轮样本。
+5. 打乱混合样本、更新学生，再开始下一轮；模型和优化器在轮间持续保留。
+6. 用隔离的固定种子独立验证学生。专家不参与验证动作选择，验证数据不进入回放池。
 
-```json
-{"state":"The upload page crashes.","question":{"type":"choice","instructions":"Route this ticket.","criteria":{"billing":"Payments and refunds","technical":"Software issues"}},"target":{"billing":0.02,"technical":0.98}}
-{"state":"Please refund my payment.","question":{"type":"noul","instructions":"Does the customer request a refund?","criteria":{"true":"Explicit request for money back","false":"No request for money back"}},"target":{"true":95,"false":5}}
-{"state":"We cannot log in and have no workaround.","question":{"type":"score","instructions":"How severe is this issue?","criteria":["Cosmetic only","Feature impaired; workaround available","Blocking; no workaround"]},"target":{"0":0,"1":0.05,"2":0.95}}
+这是结合学生轨迹采集和数据聚合的在线策略蒸馏。带回放时，并非每条训练状态都来自最新策略。
+训练阶段默认按学生合法动作概率采样；验证阶段取合法动作 argmax。
+每轮训练 `training.epochs` 遍，建议起点为 1；`training.max_steps` 可限制每轮更新次数。
+`batch_size × gradient_accumulation_steps` 是完整更新窗口大小，尾部按实际样本权重归一化。
+`max_episode_steps` 默认不设上限；设置后，达到上限会标记截断并结束这一轮，下轮重新 reset。
+
+## 应用提供两个适配器
+
+配置使用 `module:factory` 导入应用中的 Python 工厂；工厂接收对应 options 表作为关键字参数。
+从应用根目录运行，或把应用模块安装到同一 Python 环境。工厂是可信的本地代码。
+接口定义见 [`actlogit.online`](../src/actlogit/online.py)。
+
+```python
+from actlogit.online import Observation, Transition, TeacherTarget
+
+# environment = make_environment(**environment_options)
+# environment.reset(seed=...) -> Observation
+# environment.step(choice_id) -> Transition
+# environment.close()
+
+# teacher = make_teacher(**teacher_options)
+# teacher.identity -> 非空 JSON 对象，包含固定模型/规则/搜索版本
+# teacher.evaluate_batch(list[Observation]) -> list[TeacherTarget]
+# teacher.close()
 ```
 
-- `state`：被判断的文本或 JSON 数据。
-- `question`：与 `/v1/systemone` 中单个问题的格式一致，必须包含 `type`。
-- `target`：全部候选的非负权重，自动归一化；总和必须大于零。
-- `weight`：可选，样本权重，默认 1，必须大于零。
-- `metadata`：可选，来源等辅助信息，不参与训练输入。
+`Observation`：
 
-Choice 的目标键是选项 ID；Noul 是 `"true"` 和 `"false"`；Score 是从 `"0"` 开始的等级序号。目标字典顺序不影响对齐，Score 的 `criteria` 顺序决定等级序号。
+- `state`：学生可见的 JSON 状态。
+- `question`：与公开 API 相同的 Choice、Noul 或 Score 定义。
+- `legal_choices`：可选的合法动作 ID 列表，省略表示所有候选合法。
+- `context`：可选的教师侧上下文，不进入学生提示词。
 
-硬标签可以转换为 one-hot：Noul 的“是”对应 `{"true":1,"false":0}`，三等级 Score 的等级 2 对应 `{"0":0,"1":0,"2":1}`。只有一个连续评分（例如 1.5）不能唯一确定等级分布；需要先制定标注规则，得到每个等级的目标权重。不要把原始负奖励直接当成概率。
+环境 reset 必须返回至少一个合法候选。终止状态由 `Transition(terminated=True)` 表示。
+非终止 transition 必须包含下一条 observation；`truncated` 表示外部截断。
+`metrics` 是应用定义的累计数值指标，例如成功率或总收益；验证逐项报告均值及截断局数。
+Score 在在线环境中执行的是离散等级 ID，Noul 执行 `true`/`false`，由环境解释其含义。
 
-保留独立验证集；同一用户、文档或轨迹的高度相关样本应放在同一数据划分中。公开通用测试题不应混入领域训练集。
+教师输出示例（动作 ID 与数量均由任务决定）：
+
+```python
+TeacherTarget(
+    weights={"approve": 70, "review": 30, "reject": 0},
+    metadata={"source": "search", "simulations": 100},
+)
+```
+
+`weights` 可以是策略概率、MCTS 根节点访问次数、专家投票或 one-hot。
+键必须精确覆盖全部候选，包括零权重项；所有值有限且非负，总和为正，非法动作权重必须为 0。
+ActLogit 自动归一化并按 ID 对齐，不依赖字典顺序，也不要求师生共享词表或网络架构。
+返回顺序必须与输入状态顺序一致。模型不会看到教师分布、搜索统计或 provenance 元数据。
+
+教师应固定版本并对相同输入可复现。搜索适配器可以用状态哈希和固定 seed 派生独立随机流，
+不能读取真实环境未来的随机结果。`identity` 应包含权重内容哈希及影响标签的搜索参数。
+更换教师或搜索配置时开启新实验；可以加载旧 adapter 初始化，但它不是原实验的断点恢复。
+
+## 目标函数
+
+教师权重归一化为 q，学生候选 token logits 归一化为 p，最小化 `KL(q || p)`。
+固定标签下它与软交叉熵 `-Σ q(a) log p(a)` 的参数梯度相同，支持搜索产生的零访问权重。
+p 覆盖提示中的全部候选，非法候选的目标为 0，因而也受到合法性监督；执行时再按合法集合
+重新归一化。合法 mask 不自动加入模型输入。没有合法概率质量或非有限梯度时停止并报错。
+
+第一版不需要奖励模型、价值头、PPO 优势估计或整局回报反向传播。
+专家价值/Q 值可以作为 metadata 保留，但不参与当前训练目标。
+
+## 启动、恢复与推理
+
+复制 [`configs/online.example.toml`](../configs/online.example.toml)，填写本地模型路径、
+适配器工厂与应用 options。在线配置不填写 `training.data` 或 `training.eval_data`。
 
 ```bash
-uv run actlogit validate-data --data data/train.jsonl
-uv run actlogit validate-data --data data/eval.jsonl
+python -m actlogit.cli train-online --config configs/online.toml
+python -m actlogit.cli train-online --config configs/online.toml --resume
+# 扩大总轮数；已完成的轮数包含在 40 内
+python -m actlogit.cli train-online --config configs/online.toml --resume --rounds 40
+# 新输出目录，从配置的初始模型重新开始
+python -m actlogit.cli train-online --config configs/online.toml --output-dir outputs/online-new
+# 自动读取该实验最新完整 checkpoint 的 adapter
+python -m actlogit.cli serve --config configs/online.toml --adapter outputs/online
 ```
 
-## 训练配置
+输出结构：
 
-先复制对应后端的配置模板。以下命令不会覆盖已有的本地配置：
+- `episodes/round-*.json`：学生轨迹，含原始概率、实际动作、终止/截断及应用指标。
+- `episodes/round-*.jsonl`：专家标注，兼容原有 TrainingRecord 格式。
+- `checkpoints/round-*/adapter/`：可独立加载的 adapter；第 0 轮为更新前状态。
+- `checkpoints/round-*/learner/`：优化器、训练步数与后端/采样随机状态。
+- `checkpoints/round-*/replay.jsonl`、`state.json`：回放池、训练统计和固定种子验证。
+- `baseline.json`：更新前的独立验证；`latest.json`：最新完整轮次。
+
+检查点在一轮结束后提交。中途打断会恢复上一完整轮，然后重新采集并训练未完成轮，
+不会声称恢复到中途的某个 optimizer step。模型初始化随机状态也保存于第 0 轮。
+运行期间同一个输出目录只允许一个训练器。恢复检查配置与教师版本，允许增加总轮数；
+学习率、回放比例、教师、验证设置等变化应使用新实验目录。
+最新 checkpoint 不自动等于效果最佳；请根据独立验证选择具体轮次再做一次新种子最终测试。
+
+MLX 的冻结前缀快速路径、分块 gated-delta 与真实 microbatch 是可选执行优化，默认关闭。
+分块路径有架构限制，需在支持的模型上验证后启用；加速不代表任务质量改善。
+冻结层快速路径只适用于第一个可训练 block 之前的冻结前缀。
+
+## 已有离线数据
+
+已有专家数据也可使用 `train` 单独训练，无需实现环境。每行是
+`state + question + target`，`target` 与上述 weights 使用相同的非负权重规则。
+详见 [`examples/train.jsonl`](../examples/train.jsonl) 与现有 `train*.example.toml`。
 
 ```bash
-# Transformers
-cp -n configs/local.example.toml configs/local.toml
-cp -n configs/train.example.toml configs/train.toml
-
-# MLX
-cp -n configs/mlx.example.toml configs/mlx.toml
-cp -n configs/train-mlx.example.toml configs/train-mlx.toml
+python -m actlogit.cli validate-data --data data/train.jsonl
+python -m actlogit.cli train --config configs/train.toml
 ```
 
-实际使用的 `configs/*.toml` 已被 Git 忽略，只有 `.example.toml` 模板会被提交。Transformers 使用 `configs/train.toml`；MLX 使用 `configs/train-mlx.toml`。填写模型目录和数据路径：
+离线 `train --adapter ...` 是从权重开始的新优化器；在线 `train-online --resume` 才恢复
+完整训练状态。在线主流程不依赖离线数据。另可运行[通用能力回归](general-evaluation.zh-CN.md)。
 
-```toml
-[lora]
-rank = 16
-alpha = 32
-dropout = 0.0
-target_modules = "all-linear"
-
-[training]
-data = "data/train.jsonl"
-eval_data = "data/eval.jsonl"
-output_dir = "outputs/domain-adapter"
-epochs = 3
-batch_size = 2
-gradient_accumulation_steps = 4
-learning_rate = 0.0001
-seed = 42
-```
-
-这些参数是起点，根据验证集调整学习率和训练轮数。Transformers 支持 `gradient_checkpointing = true` 节省训练显存。MLX 可设置 `lora.num_layers`，只训练末尾指定数量的 block；省略时覆盖全部 block。两种后端都冻结基座，仅更新 LoRA 参数。
-
-```bash
-uv run actlogit train --config configs/train.toml
-uv run actlogit evaluate --config configs/local.toml --data data/eval.jsonl
-uv run actlogit evaluate --config configs/local.toml \
-  --adapter outputs/domain-adapter --data data/eval.jsonl
-```
-
-MLX 对应替换为 `configs/train-mlx.toml` 和 `configs/mlx.toml`。评估报告包括 Forward KL、交叉熵和目标最大概率选项命中率；KL 越低，预测分布越接近目标分布。未指定 `eval_data` 时报告使用训练集，不能据此判断泛化。
-
-输出目录包含适配器、加载配置、tokenizer 和 `metrics.json`。推理时使用相同模型及 `[prompt]` 设置：
-
-```bash
-uv run actlogit serve --config configs/local.toml --adapter outputs/domain-adapter
-```
-
-继续训练已有适配器时，用 `--adapter` 指定原目录，并在训练配置中设置一个新的 `output_dir`。这会开始新的优化器，不是从中断步骤恢复。Transformers 和 MLX 的适配器格式不能互换。
-
-## 训练目标
-
-ActLogit 优化 `D_KL(q || p)`：`q` 是离线数据中的目标分布，`p` 是模型对本次候选的预测分布。目标固定时，这与软标签交叉熵产生相同的参数梯度。基座权重保持冻结，LoRA 更新适配器参数。
-
-目标分布可来自人工标签、专家投票、搜索统计或预先收集的教师概率。准备好数据后，训练无需外部模型服务。
-
-训练后同时检查领域验证集和[通用能力回归](general-evaluation.zh-CN.md)，分别确认任务收益与原有能力的变化。
+算法依据：[DAgger](https://proceedings.mlr.press/v15/ross11a.html)、
+[GKD](https://arxiv.org/abs/2306.13649)、[Expert Iteration](https://arxiv.org/abs/1705.08439)。
+这些方法提供设计依据，具体任务收益应通过独立实验确认。

@@ -57,7 +57,11 @@ class DecisionEngine:
             return MLXDecisionEngine.load(config, trainable_adapter=trainable_adapter)
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        settings = config.model
+        from actlogit.trainer import resolve_adapter
+
+        settings = config.model.model_copy()
+        if settings.adapter_path:
+            settings.adapter_path = resolve_adapter(settings.adapter_path)
         path = Path(settings.name_or_path).expanduser()
         if not path.is_dir():
             raise ValueError(f"Transformers requires an existing local model directory: {path}")

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "actlogit"
 version = "0.1.0"
-description = "Local Choice, Noul and Score inference with offline Forward KL + LoRA fine-tuning"
+description = "Local typed decisions and generic online policy distillation"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
